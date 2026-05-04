@@ -2,26 +2,44 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { getSession, signOut as doSignOut, type PublicUser } from "@/lib/auth";
+import {
+  getSession,
+  signOut as doSignOut,
+  type PublicUser,
+} from "@/lib/auth";
 
 export function useAuth() {
   const [user, setUser] = useState<PublicUser | null | undefined>(undefined);
 
   useEffect(() => {
-    setUser(getSession());
-    const handler = (e: StorageEvent) => {
-      if (e.key === "chess.session.v1" || e.key === null) {
-        setUser(getSession());
-      }
+    let cancelled = false;
+    getSession().then((u) => {
+      if (!cancelled) setUser(u);
+    });
+
+    // Cross-tab logout: when localStorage token changes elsewhere, refresh.
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== "chess.token.v1" && e.key !== null) return;
+      getSession().then((u) => {
+        if (!cancelled) setUser(u);
+      });
     };
-    window.addEventListener("storage", handler);
-    return () => window.removeEventListener("storage", handler);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const u = await getSession();
+    setUser(u);
   }, []);
 
   return {
     user,
     isLoading: user === undefined,
-    refresh: () => setUser(getSession()),
+    refresh,
   };
 }
 
@@ -53,8 +71,8 @@ export function useRequireGuest() {
 
 export function useSignOut() {
   const router = useRouter();
-  return useCallback(() => {
-    doSignOut();
+  return useCallback(async () => {
+    await doSignOut();
     router.replace("/login");
   }, [router]);
 }
