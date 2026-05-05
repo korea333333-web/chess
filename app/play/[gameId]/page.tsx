@@ -80,8 +80,6 @@ export default function OnlineGamePage({
   const [position, setPosition] = useState<string>(() => chessRef.current!.fen());
   const [selectedSquare, setSelectedSquare] = useState<string | null>(null);
   const [legalMoves, setLegalMoves] = useState<Move[]>([]);
-  const [whiteMs, setWhiteMs] = useState(0);
-  const [blackMs, setBlackMs] = useState(0);
   const [result, setResult] = useState<GameResult | null>(null);
   const [submitting, setSubmitting] = useState(false);
   // Tracks an in-flight /move request so the polling loop knows not to
@@ -89,6 +87,27 @@ export default function OnlineGamePage({
   // (the /move write hasn't been read back yet on the next poll tick).
   const submittingRef = useRef(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [premoveEnabled, setPremoveEnabledState] = useState<boolean>(true);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = localStorage.getItem("chess.premove.v1");
+    if (stored === "0") setPremoveEnabledState(false);
+  }, []);
+  const setPremoveEnabled = useCallback((next: boolean) => {
+    setPremoveEnabledState(next);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("chess.premove.v1", next ? "1" : "0");
+    }
+    if (!next) {
+      // Drop any queued premoves when the user opts out.
+      setPremoves([]);
+    }
+  }, []);
+  // 100ms tick that lets the live-clock memo recompute against
+  // game.last_move_at + Date.now(). We avoid storing whiteMs/blackMs in
+  // state so the polling loop can't clobber a fresh local tick with the
+  // server's stale snapshot from the moment of the last move.
+  const [clockTick, setClockTick] = useState(0);
   // chess.com-style premove queue (multiple moves can stack while it's the
   // opponent's turn). Each opponent move consumes the head; an illegal head
   // clears the chain.
@@ -115,6 +134,26 @@ export default function OnlineGamePage({
   }, [game, user]);
 
   const myLabel = user?.username ?? "";
+
+  // Live clocks: server snapshot (game.white_ms / game.black_ms) is from
+  // the moment of the last move (game.last_move_at). We display
+  // snapshot - elapsed for the side to move, and just snapshot for the
+  // other side. clockTick re-triggers this memo every 100ms.
+  const { whiteMs, blackMs } = useMemo(() => {
+    void clockTick;
+    if (!game) return { whiteMs: 0, blackMs: 0 };
+    if (game.status !== "active" || result) {
+      return { whiteMs: game.white_ms, blackMs: game.black_ms };
+    }
+    const turn = chessRef.current?.turn();
+    const elapsed = Date.now() - game.last_move_at;
+    return {
+      whiteMs:
+        turn === "w" ? Math.max(0, game.white_ms - elapsed) : game.white_ms,
+      blackMs:
+        turn === "b" ? Math.max(0, game.black_ms - elapsed) : game.black_ms,
+    };
+  }, [game, result, clockTick]);
 
   const opponentMs = myColor === "w" ? blackMs : whiteMs;
   const playerMs = myColor === "w" ? whiteMs : blackMs;
@@ -156,9 +195,6 @@ export default function OnlineGamePage({
         }
         return;
       }
-
-      setWhiteMs(g.white_ms);
-      setBlackMs(g.black_ms);
 
       // Apply server FEN to local chess if it changed (i.e. an opponent
       // move arrived). If it's *my* most recent move that's reflected, the
@@ -229,17 +265,12 @@ export default function OnlineGamePage({
 
   // Local clock tick — decrement the side-to-move's remaining time. Server
   // values overwrite us on every poll, so any drift self-corrects.
+  // Drive the live-clock memo forward at CLOCK_TICK_MS. The memo reads
+  // `clockTick` so this effect just bumps a counter; no clock state is
+  // overwritten by this loop or by polling.
   useEffect(() => {
     if (!game || game.status !== "active" || result) return;
-    const id = setInterval(() => {
-      const turn = chessRef.current?.turn();
-      if (!turn) return;
-      if (turn === "w") {
-        setWhiteMs((prev) => Math.max(0, prev - CLOCK_TICK_MS));
-      } else {
-        setBlackMs((prev) => Math.max(0, prev - CLOCK_TICK_MS));
-      }
-    }, CLOCK_TICK_MS);
+    const id = setInterval(() => setClockTick((t) => t + 1), CLOCK_TICK_MS);
     return () => clearInterval(id);
   }, [game, result]);
 
@@ -311,9 +342,11 @@ export default function OnlineGamePage({
         return true;
       }
 
-      // Opponent's turn — try to append to the premove queue. Reject the
-      // drop if it isn't a fully legal move in the speculative position
-      // so users can't queue impossible moves.
+      // Opponent's turn — premove disabled? do nothing.
+      if (!premoveEnabled) return false;
+      // Try to append to the premove queue. Reject the drop if it isn't
+      // a fully legal move in the speculative position so users can't
+      // queue impossible moves.
       if (!myColor) return false;
       const spec = buildSpeculative(
         chessRef.current!.fen(),
@@ -330,7 +363,7 @@ export default function OnlineGamePage({
       setLegalMoves([]);
       return false;
     },
-    [game, result, isMyTurn, myColor, submitMove],
+    [game, result, isMyTurn, myColor, submitMove, premoveEnabled],
   );
 
   const selectSquare = useCallback(
@@ -372,7 +405,8 @@ export default function OnlineGamePage({
         return;
       }
 
-      // Opponent's turn — premove queue mode.
+      // Opponent's turn — premove disabled? do nothing.
+      if (!premoveEnabled) return;
       const cancelIdx = premoves.findIndex(
         (pm) => pm.from === square || pm.to === square,
       );
@@ -417,6 +451,7 @@ export default function OnlineGamePage({
       myColor,
       selectSquare,
       submitMove,
+      premoveEnabled,
     ],
   );
 
@@ -481,6 +516,7 @@ export default function OnlineGamePage({
   // clear the rest of the queue too (a failed head usually means the
   // chain was planned against a position that no longer holds).
   useEffect(() => {
+    if (!premoveEnabled) return;
     if (!game || result || game.status !== "active") return;
     if (!chessRef.current) return;
     if (chessRef.current.turn() !== myColor) return;
@@ -497,7 +533,16 @@ export default function OnlineGamePage({
     return () => {
       cancelled = true;
     };
-  }, [game, result, position, myColor, premoves, submitting, submitMove]);
+  }, [
+    game,
+    result,
+    position,
+    myColor,
+    premoves,
+    submitting,
+    submitMove,
+    premoveEnabled,
+  ]);
 
   const handleResign = useCallback(async () => {
     if (!game || result) return;
@@ -628,7 +673,7 @@ export default function OnlineGamePage({
           </p>
         )}
 
-        <div className="mt-6 flex gap-3">
+        <div className="mt-6 flex flex-wrap gap-3">
           <Button
             variant="secondary"
             onClick={handleResign}
@@ -642,6 +687,13 @@ export default function OnlineGamePage({
             disabled={!!result || game.status !== "active"}
           >
             {opponentDrawOffered ? "무승부 수락" : "무승부 제안"}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => setPremoveEnabled(!premoveEnabled)}
+            title="미리두기 OFF로 끄면 상대 차례에 클릭/드래그가 무시됩니다 (렉 줄이기)"
+          >
+            미리두기 {premoveEnabled ? "ON" : "OFF"}
           </Button>
           <Link href="/">
             <Button variant="ghost">메인</Button>

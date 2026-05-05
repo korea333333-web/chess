@@ -481,24 +481,57 @@ function getGame_(body) {
 
   const cache = CacheService.getScriptCache();
   const cached = cache.get(gameCacheKey_(gameId));
+  let game;
+  let needsCachePut = false;
   if (cached) {
-    const game = JSON.parse(cached);
-    if (game.white_id !== user.id && game.black_id !== user.id) {
-      throw new Error("Not in this game");
-    }
-    return { game };
+    game = JSON.parse(cached);
+  } else {
+    const row = findOne_("games", (g) => g.id === gameId);
+    if (!row) throw new Error("Game not found");
+    game = serializeGame_(row);
+    needsCachePut = true;
   }
 
-  const row = findOne_("games", (g) => g.id === gameId);
-  if (!row) throw new Error("Game not found");
-  if (row.white_id !== user.id && row.black_id !== user.id) {
+  if (game.white_id !== user.id && game.black_id !== user.id) {
     throw new Error("Not in this game");
   }
-  const serialized = serializeGame_(row);
-  try {
-    cache.put(gameCacheKey_(gameId), JSON.stringify(serialized), 60);
-  } catch (_e) { /* cache write best-effort */ }
-  return { game: serialized };
+
+  // Server-side timeout: if the side to move has overspent the clock, end
+  // the game right now with a loss for that side. This converts what used
+  // to be a hung "active" game (clock at zero, no move ever submitted)
+  // into a real result that both clients see on their next poll.
+  if (game.status === "active") {
+    const turn = String(game.fen).split(" ")[1];
+    const elapsed = nowMs_() - Number(game.last_move_at);
+    const remainingActive =
+      turn === "w" ? Number(game.white_ms) : Number(game.black_ms);
+    if (remainingActive - elapsed <= 0) {
+      const row = findOne_("games", (g) => g.id === gameId);
+      if (row && row.status === "active") {
+        const winner = turn === "w" ? "black_wins" : "white_wins";
+        const updates = {
+          status: "ended",
+          result: winner,
+          end_reason: "timeout",
+          ended_at: nowMs_(),
+        };
+        if (turn === "w") updates.white_ms = 0;
+        else updates.black_ms = 0;
+        updateRowAt_("games", row._row, updates);
+        applyEloIfRanked_(row, winner);
+        invalidateGameCache_(gameId);
+        Object.assign(game, updates);
+        needsCachePut = false;
+      }
+    }
+  }
+
+  if (needsCachePut) {
+    try {
+      cache.put(gameCacheKey_(gameId), JSON.stringify(game), 60);
+    } catch (_e) { /* cache write best-effort */ }
+  }
+  return { game };
 }
 
 function serializeGame_(game) {
