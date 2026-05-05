@@ -475,7 +475,11 @@ export default function OnlineGamePage({
   }, [position, selectedSquare, legalMoves, premoves]);
 
   // Auto-apply the head of the premove queue once it becomes my turn.
-  // submitMove handles server validation; an illegal head clears the chain.
+  // We pop the head from the queue *immediately* (so the red highlight
+  // disappears at the instant the move is being submitted, not 2-3
+  // seconds later when Apps Script responds). On submit failure, we
+  // clear the rest of the queue too (a failed head usually means the
+  // chain was planned against a position that no longer holds).
   useEffect(() => {
     if (!game || result || game.status !== "active") return;
     if (!chessRef.current) return;
@@ -483,12 +487,12 @@ export default function OnlineGamePage({
     if (premoves.length === 0) return;
     if (submitting) return;
     const head = premoves[0];
+    setPremoves((prev) => prev.slice(1));
     let cancelled = false;
     void (async () => {
       const ok = await submitMove(head.from, head.to);
       if (cancelled) return;
-      if (ok) setPremoves((prev) => prev.slice(1));
-      else setPremoves([]);
+      if (!ok) setPremoves([]);
     })();
     return () => {
       cancelled = true;

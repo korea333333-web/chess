@@ -463,15 +463,42 @@ function inviteRespond_(body) {
 }
 
 // ============= GAMES =============
+// Cache helpers — Sheet reads cost 1-2s each. We cache serialized game
+// state for 60s and invalidate on every write so /game polls usually hit
+// memory instead of round-tripping through the spreadsheet API.
+function gameCacheKey_(gameId) { return "game:" + gameId; }
+
+function invalidateGameCache_(gameId) {
+  try {
+    CacheService.getScriptCache().remove(gameCacheKey_(gameId));
+  } catch (_e) { /* cache outage shouldn't break writes */ }
+}
+
 function getGame_(body) {
   const user = authenticate_(String(body.token || ""));
   const gameId = String(body.game_id || "");
-  const game = findOne_("games", (g) => g.id === gameId);
-  if (!game) throw new Error("Game not found");
-  if (game.white_id !== user.id && game.black_id !== user.id) {
+  if (!gameId) throw new Error("Game not found");
+
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(gameCacheKey_(gameId));
+  if (cached) {
+    const game = JSON.parse(cached);
+    if (game.white_id !== user.id && game.black_id !== user.id) {
+      throw new Error("Not in this game");
+    }
+    return { game };
+  }
+
+  const row = findOne_("games", (g) => g.id === gameId);
+  if (!row) throw new Error("Game not found");
+  if (row.white_id !== user.id && row.black_id !== user.id) {
     throw new Error("Not in this game");
   }
-  return { game: serializeGame_(game) };
+  const serialized = serializeGame_(row);
+  try {
+    cache.put(gameCacheKey_(gameId), JSON.stringify(serialized), 60);
+  } catch (_e) { /* cache write best-effort */ }
+  return { game: serialized };
 }
 
 function serializeGame_(game) {
@@ -550,6 +577,7 @@ function makeMove_(body) {
   }
 
   updateRowAt_("games", game._row, updates);
+  invalidateGameCache_(game.id);
   return {};
 }
 
@@ -570,6 +598,7 @@ function resign_(body) {
     end_reason: "resign",
     ended_at: nowMs_(),
   });
+  invalidateGameCache_(game.id);
   applyEloIfRanked_(game, result);
   return {};
 }
@@ -587,6 +616,7 @@ function drawAction_(body) {
 
   if (op === "offer") {
     updateRowAt_("games", game._row, { draw_offer_by: user.id });
+    invalidateGameCache_(game.id);
     return {};
   }
   if (op === "decline") {
@@ -594,6 +624,7 @@ function drawAction_(body) {
       throw new Error("거절할 제안 없음");
     }
     updateRowAt_("games", game._row, { draw_offer_by: "" });
+    invalidateGameCache_(game.id);
     return {};
   }
   if (op === "accept") {
@@ -607,6 +638,7 @@ function drawAction_(body) {
       draw_offer_by: "",
       ended_at: nowMs_(),
     });
+    invalidateGameCache_(game.id);
     applyEloIfRanked_(game, "draw");
     return {};
   }
