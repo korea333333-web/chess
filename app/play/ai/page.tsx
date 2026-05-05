@@ -74,14 +74,16 @@ export default function AiPlayPage() {
   const [blackMs, setBlackMs] = useState(0);
   const [isAiThinking, setIsAiThinking] = useState(false);
   const [result, setResult] = useState<GameResult | null>(null);
-  const [premove, setPremove] = useState<{
-    from: string;
-    to: string;
-  } | null>(null);
-  const premoveRef = useRef<{ from: string; to: string } | null>(null);
+  // chess.com-style premove queue: multiple moves can be lined up while
+  // the AI is thinking. Each AI response consumes the head of the queue;
+  // an illegal head clears the entire chain.
+  const [premoves, setPremoves] = useState<
+    Array<{ from: string; to: string }>
+  >([]);
+  const premovesRef = useRef<Array<{ from: string; to: string }>>([]);
   useEffect(() => {
-    premoveRef.current = premove;
-  }, [premove]);
+    premovesRef.current = premoves;
+  }, [premoves]);
   const selectedSquareRef = useRef<string | null>(null);
   useEffect(() => {
     selectedSquareRef.current = selectedSquare;
@@ -109,7 +111,7 @@ export default function AiPlayPage() {
     setBlackMs(initialMs);
     setIsAiThinking(false);
     setResult(null);
-    setPremove(null);
+    setPremoves([]);
     setPhase("playing");
     sounds.start();
   }, [colorChoice, timeChoice]);
@@ -217,17 +219,21 @@ export default function AiPlayPage() {
 
       let end = checkGameEnd(c);
 
-      // Try queued premove right away so capture animations stay in sync.
+      // Try the head of the premove queue. Each AI iteration consumes at
+      // most one premove. If the head is illegal in the new position, the
+      // entire chain is discarded (a typical chess.com behavior).
       let pmApplied = false;
       let pmCheck = false;
       let pmCheckmate = false;
       let pmCapture = false;
-      const queued = premoveRef.current;
-      if (!end && queued) {
+      const queue = premovesRef.current;
+      let nextQueue: Array<{ from: string; to: string }> = queue;
+      if (!end && queue.length > 0) {
+        const head = queue[0];
         try {
           const pmM = c.move({
-            from: queued.from,
-            to: queued.to,
+            from: head.from,
+            to: head.to,
             promotion: "q",
           });
           if (pmM) {
@@ -237,9 +243,12 @@ export default function AiPlayPage() {
             pmCheckmate = c.isCheckmate();
             pmCapture = pmM.flags.includes("c") || pmM.flags.includes("e");
             end = checkGameEnd(c);
+            nextQueue = queue.slice(1);
+          } else {
+            nextQueue = [];
           }
         } catch {
-          // premove illegal in resulting position — silently discard
+          nextQueue = [];
         }
       }
 
@@ -253,7 +262,7 @@ export default function AiPlayPage() {
 
       setPosition(c.fen());
       setMoveCount((n) => n + plies);
-      setPremove(null);
+      setPremoves(nextQueue);
 
       // Selection persistence: if the player had selected a piece during the
       // AI's turn but didn't queue a premove, keep the selection on their
@@ -327,20 +336,33 @@ export default function AiPlayPage() {
       if (!chess) return false;
       if (result) return false;
 
-      const piece = chess.get(sourceSquare as Parameters<Chess["get"]>[0]);
-      if (!piece || piece.color !== playerColor) return false;
-
       if (chess.turn() === playerColor) {
+        // My turn — go through the real chess board.
+        const piece = chess.get(sourceSquare as Parameters<Chess["get"]>[0]);
+        if (!piece || piece.color !== playerColor) return false;
         return tryMove(sourceSquare, targetSquare);
       }
 
-      // AI's turn — queue premove via drag.
-      setPremove({ from: sourceSquare, to: targetSquare });
+      // AI's turn — append to the premove queue. The piece check is
+      // against the speculative chess (with prior premoves applied),
+      // so chained drags work even though the real board hasn't moved.
+      const real = chessRef.current!;
+      const spec = new Chess(real.fen());
+      for (const pm of premovesRef.current) {
+        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
+        if (!p) break;
+        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
+        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
+        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
+      }
+      const piece = spec.get(sourceSquare as Parameters<Chess["get"]>[0]);
+      if (!piece || piece.color !== playerColor) return false;
+      setPremoves((prev) => [
+        ...prev,
+        { from: sourceSquare, to: targetSquare },
+      ]);
       setSelectedSquare(null);
       setLegalMoves([]);
-      // Return false so the library snaps the piece back to source. Position
-      // hasn't actually changed; the red premove highlight signals the
-      // queued move.
       return false;
     },
     [playerColor, result, tryMove],
@@ -390,9 +412,15 @@ export default function AiPlayPage() {
         return;
       }
 
-      // AI's turn — premove mode
-      if (premove && (square === premove.from || square === premove.to)) {
-        setPremove(null);
+      // AI's turn — premove queue mode.
+      // Clicking on a queued premove from/to cancels that one and any
+      // premoves stacked on top of it (since they were planned against a
+      // position that no longer holds).
+      const cancelIdx = premoves.findIndex(
+        (pm) => pm.from === square || pm.to === square,
+      );
+      if (cancelIdx >= 0) {
+        setPremoves(premoves.slice(0, cancelIdx));
         setSelectedSquare(null);
         setLegalMoves([]);
         return;
@@ -402,18 +430,31 @@ export default function AiPlayPage() {
         setLegalMoves([]);
         return;
       }
+      // Build a speculative position with the existing queue applied so
+      // that "is the from-square my piece?" reflects the chained state.
+      const spec = new Chess(chess.fen());
+      for (const pm of premoves) {
+        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
+        if (!p) break;
+        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
+        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
+        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
+      }
       if (selectedSquare) {
-        const fromPiece = chess.get(
+        const fromPiece = spec.get(
           selectedSquare as Parameters<Chess["get"]>[0],
         );
         if (fromPiece && fromPiece.color === playerColor) {
-          setPremove({ from: selectedSquare, to: square });
+          setPremoves((prev) => [
+            ...prev,
+            { from: selectedSquare, to: square },
+          ]);
         }
         setSelectedSquare(null);
         setLegalMoves([]);
         return;
       }
-      const piece = chess.get(square as Parameters<Chess["get"]>[0]);
+      const piece = spec.get(square as Parameters<Chess["get"]>[0]);
       if (piece && piece.color === playerColor) {
         setSelectedSquare(square);
         setLegalMoves([]);
@@ -424,11 +465,35 @@ export default function AiPlayPage() {
       playerColor,
       selectedSquare,
       legalMoves,
-      premove,
+      premoves,
       selectSquare,
       tryMove,
     ],
   );
+
+  // Speculative position with all queued premoves applied. Shown to the
+  // player so they can plan multi-move chains while the AI is thinking.
+  // Uses chess.js put/remove (no rule validation) so chains of "what if"
+  // moves can be visualized even if a later move depends on an earlier
+  // hypothetical capture.
+  const displayPosition = useMemo(() => {
+    if (!chessRef.current) return position;
+    if (premoves.length === 0) return position;
+    const spec = new Chess(chessRef.current.fen());
+    for (const pm of premoves) {
+      const piece = spec.get(pm.from as Parameters<Chess["get"]>[0]);
+      if (!piece) break;
+      spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
+      spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
+      const isPromotion =
+        piece.type === "p" && (pm.to[1] === "8" || pm.to[1] === "1");
+      spec.put(
+        isPromotion ? { type: "q", color: piece.color } : piece,
+        pm.to as Parameters<Chess["put"]>[1],
+      );
+    }
+    return spec.fen();
+  }, [position, premoves]);
 
   // (Premove application now happens inside the AI move callback above
   // so that AI's move and the premove commit in a single React batch.)
@@ -470,23 +535,23 @@ export default function AiPlayPage() {
       }
     }
 
-    if (premove) {
-      const premoveStyle: React.CSSProperties = {
-        boxShadow:
-          "inset 0 0 0 100px rgba(220,38,38,0.55), inset 0 0 0 4px rgba(127,29,29,1)",
-      };
-      styles[premove.from] = {
-        ...(styles[premove.from] ?? {}),
+    const premoveStyle: React.CSSProperties = {
+      boxShadow:
+        "inset 0 0 0 100px rgba(220,38,38,0.55), inset 0 0 0 4px rgba(127,29,29,1)",
+    };
+    for (const pm of premoves) {
+      styles[pm.from] = {
+        ...(styles[pm.from] ?? {}),
         ...premoveStyle,
       };
-      styles[premove.to] = {
-        ...(styles[premove.to] ?? {}),
+      styles[pm.to] = {
+        ...(styles[pm.to] ?? {}),
         ...premoveStyle,
       };
     }
 
     return styles;
-  }, [position, selectedSquare, legalMoves, premove]);
+  }, [position, selectedSquare, legalMoves, premoves]);
 
   const handleResign = useCallback(() => {
     if (!chessRef.current || result) return;
@@ -602,7 +667,7 @@ export default function AiPlayPage() {
         <ChessBoardSurface className="my-4 w-full max-w-[560px] aspect-square">
           <Chessboard
             options={{
-              position,
+              position: displayPosition,
               onSquareClick: handleSquareClick,
               onPieceDrop: handlePieceDrop,
               squareStyles,
@@ -640,8 +705,8 @@ export default function AiPlayPage() {
           ms={playerMs}
           isActive={isPlayerTurn}
           subtitle={
-            premove
-              ? `미리둠: ${premove.from} → ${premove.to}`
+            premoves.length > 0
+              ? `미리둠 ${premoves.length}수 대기 중`
               : `수 ${moveCount}`
           }
         />

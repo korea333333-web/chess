@@ -281,8 +281,23 @@ function matchmake_(body) {
   const user = authenticate_(String(body.token || ""));
   const tc = Number(body.time_control_min);
   if (![3, 5, 10].includes(tc)) throw new Error("Invalid time_control");
-  const myElo = Number(user.elo);
 
+  // If a game was already created for me from the other side (e.g. because
+  // an opponent's matchmake call paired us up while I was waiting), surface
+  // it instead of re-adding myself to the queue.
+  const recent = findMany_("games", function (g) {
+    return (g.white_id === user.id || g.black_id === user.id)
+      && g.status === "active"
+      && nowMs_() - Number(g.created_at) < 10 * 60 * 1000;
+  });
+  if (recent.length > 0) {
+    const my = findOne_("queue", function (x) { return x.user_id === user.id; });
+    if (my) deleteRowAt_("queue", my._row);
+    recent.sort(function (a, b) { return Number(b.created_at) - Number(a.created_at); });
+    return { matched: true, game_id: recent[0].id };
+  }
+
+  const myElo = Number(user.elo);
   const { rows } = readAll_("queue");
   for (const q of rows) {
     if (q.user_id === user.id) continue;
