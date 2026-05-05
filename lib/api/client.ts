@@ -37,8 +37,20 @@ export async function callApi<T = Record<string, unknown>>(
       body: JSON.stringify({ action, ...body }),
       redirect: "follow",
     });
-    const data = (await res.json()) as ApiResult<T>;
-    return data;
+    const text = await res.text();
+    try {
+      return JSON.parse(text) as ApiResult<T>;
+    } catch {
+      // Apps Script can return an HTML auth/error page when the deployment
+      // is unreachable or rate-limited. Surface a friendlier message.
+      const looksLikeHtml = text.trim().startsWith("<");
+      return {
+        ok: false,
+        error: looksLikeHtml
+          ? "서버가 응답하지 않습니다. 잠시 후 다시 시도해주세요."
+          : "응답을 읽을 수 없습니다.",
+      };
+    }
   } catch (err) {
     return {
       ok: false,

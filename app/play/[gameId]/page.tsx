@@ -20,6 +20,7 @@ import { GameEndModal, type GameResult } from "@/components/GameEndModal";
 import { SoundToggle } from "@/components/SoundToggle";
 import { sounds } from "@/lib/sound";
 import { callApiAuthed } from "@/lib/api/client";
+import { buildSpeculative, isLegalPremove } from "@/lib/premove";
 
 type GameDto = {
   id: string;
@@ -41,7 +42,7 @@ type GameDto = {
   draw_offer_by: string;
 };
 
-const POLL_INTERVAL_MS = 2000;
+const POLL_INTERVAL_MS = 1000;
 const CLOCK_TICK_MS = 100;
 
 const END_REASON_KO: Record<string, string> = {
@@ -83,6 +84,10 @@ export default function OnlineGamePage({
   const [blackMs, setBlackMs] = useState(0);
   const [result, setResult] = useState<GameResult | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // Tracks an in-flight /move request so the polling loop knows not to
+  // overwrite the local optimistic position with the server's stale one
+  // (the /move write hasn't been read back yet on the next poll tick).
+  const submittingRef = useRef(false);
   const [actionError, setActionError] = useState<string | null>(null);
   // chess.com-style premove queue (multiple moves can stack while it's the
   // opponent's turn). Each opponent move consumes the head; an illegal head
@@ -142,6 +147,16 @@ export default function OnlineGamePage({
       }
       const g = res.game;
       setGame(g);
+      // Skip clock + position updates while a /move request is in-flight,
+      // otherwise the server's stale read can clobber the local optimistic
+      // position and "rewind" the move the player just made.
+      if (submittingRef.current) {
+        if (g.status === "active") {
+          timer = setTimeout(tick, POLL_INTERVAL_MS);
+        }
+        return;
+      }
+
       setWhiteMs(g.white_ms);
       setBlackMs(g.black_ms);
 
@@ -254,6 +269,7 @@ export default function OnlineGamePage({
       setLegalMoves([]);
       pickAndPlay(isCheckmate, isCheck, isCapture);
 
+      submittingRef.current = true;
       setSubmitting(true);
       const res = await callApiAuthed("move", {
         game_id: game.id,
@@ -263,6 +279,7 @@ export default function OnlineGamePage({
         is_stalemate: isStalemate,
         is_draw: isDraw,
       });
+      submittingRef.current = false;
       setSubmitting(false);
 
       if (!res.ok) {
@@ -294,19 +311,17 @@ export default function OnlineGamePage({
         return true;
       }
 
-      // Opponent's turn — append to premove queue, validating against the
-      // speculative position so chained drags work.
-      const real = chessRef.current!;
-      const spec = new Chess(real.fen());
-      for (const pm of premovesRef.current) {
-        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
-        if (!p) break;
-        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
-        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
-        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
+      // Opponent's turn — try to append to the premove queue. Reject the
+      // drop if it isn't a fully legal move in the speculative position
+      // so users can't queue impossible moves.
+      if (!myColor) return false;
+      const spec = buildSpeculative(
+        chessRef.current!.fen(),
+        premovesRef.current,
+      );
+      if (!isLegalPremove(spec, sourceSquare, targetSquare, myColor)) {
+        return false;
       }
-      const piece = spec.get(sourceSquare as Parameters<Chess["get"]>[0]);
-      if (!piece || piece.color !== myColor) return false;
       setPremoves((prev) => [
         ...prev,
         { from: sourceSquare, to: targetSquare },
@@ -372,20 +387,10 @@ export default function OnlineGamePage({
         setLegalMoves([]);
         return;
       }
-      const real = chessRef.current!;
-      const spec = new Chess(real.fen());
-      for (const pm of premoves) {
-        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
-        if (!p) break;
-        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
-        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
-        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
-      }
+      if (!myColor) return;
+      const spec = buildSpeculative(chessRef.current!.fen(), premoves);
       if (selectedSquare) {
-        const fromPiece = spec.get(
-          selectedSquare as Parameters<Chess["get"]>[0],
-        );
-        if (fromPiece && fromPiece.color === myColor) {
+        if (isLegalPremove(spec, selectedSquare, square, myColor)) {
           setPremoves((prev) => [
             ...prev,
             { from: selectedSquare, to: square },
@@ -419,20 +424,7 @@ export default function OnlineGamePage({
   const displayPosition = useMemo(() => {
     if (!chessRef.current) return position;
     if (premoves.length === 0) return position;
-    const spec = new Chess(chessRef.current.fen());
-    for (const pm of premoves) {
-      const piece = spec.get(pm.from as Parameters<Chess["get"]>[0]);
-      if (!piece) break;
-      spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
-      spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
-      const isPromotion =
-        piece.type === "p" && (pm.to[1] === "8" || pm.to[1] === "1");
-      spec.put(
-        isPromotion ? { type: "q", color: piece.color } : piece,
-        pm.to as Parameters<Chess["put"]>[1],
-      );
-    }
-    return spec.fen();
+    return buildSpeculative(chessRef.current.fen(), premoves).fen();
   }, [position, premoves]);
 
   const squareStyles = useMemo<Record<string, React.CSSProperties>>(() => {

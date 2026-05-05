@@ -28,7 +28,14 @@ const SCHEMA = {
 };
 
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const ELO_K = 32;
+
+// Provisional rating: large K early so ELO calibrates quickly, then
+// settles down once the player has a stable history.
+function eloKForGames_(games) {
+  if (games < 10) return 60;
+  if (games < 30) return 32;
+  return 16;
+}
 
 // ============= SETUP — Run this once before deploying =============
 function setup() {
@@ -270,6 +277,7 @@ function ranking_() {
       losses: Number(u.losses),
       draws: Number(u.draws),
     }))
+    .filter((u) => u.wins + u.losses + u.draws > 0)
     .sort((a, b) => b.elo - a.elo)
     .slice(0, 100)
     .map((u, i) => ({ rank: i + 1, ...u }));
@@ -613,14 +621,18 @@ function applyEloIfRanked_(game, result) {
   if (!white || !black) return;
   const ra = Number(white.elo);
   const rb = Number(black.elo);
+  const whiteGames = Number(white.wins) + Number(white.losses) + Number(white.draws);
+  const blackGames = Number(black.wins) + Number(black.losses) + Number(black.draws);
+  const ka = eloKForGames_(whiteGames);
+  const kb = eloKForGames_(blackGames);
   const ea = 1 / (1 + Math.pow(10, (rb - ra) / 400));
   const eb = 1 - ea;
   let sa, sb;
   if (result === "white_wins") { sa = 1;   sb = 0;   }
   else if (result === "black_wins") { sa = 0; sb = 1; }
   else { sa = 0.5; sb = 0.5; }
-  const newRa = Math.round(ra + ELO_K * (sa - ea));
-  const newRb = Math.round(rb + ELO_K * (sb - eb));
+  const newRa = Math.round(ra + ka * (sa - ea));
+  const newRb = Math.round(rb + kb * (sb - eb));
   updateRowAt_("users", white._row, {
     elo: newRa,
     wins: Number(white.wins) + (result === "white_wins" ? 1 : 0),

@@ -24,6 +24,7 @@ import {
   DIFFICULTY_LEVELS,
   type Difficulty,
 } from "@/lib/ai";
+import { buildSpeculative, isLegalPremove } from "@/lib/premove";
 import { cn } from "@/lib/utils";
 
 type ColorChoice = "w" | "b" | "random";
@@ -343,20 +344,15 @@ export default function AiPlayPage() {
         return tryMove(sourceSquare, targetSquare);
       }
 
-      // AI's turn — append to the premove queue. The piece check is
-      // against the speculative chess (with prior premoves applied),
-      // so chained drags work even though the real board hasn't moved.
-      const real = chessRef.current!;
-      const spec = new Chess(real.fen());
-      for (const pm of premovesRef.current) {
-        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
-        if (!p) break;
-        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
-        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
-        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
+      // AI's turn — try to append to the premove queue, validated against
+      // the speculative chess so users can't drop into impossible moves.
+      const spec = buildSpeculative(
+        chessRef.current!.fen(),
+        premovesRef.current,
+      );
+      if (!isLegalPremove(spec, sourceSquare, targetSquare, playerColor)) {
+        return false;
       }
-      const piece = spec.get(sourceSquare as Parameters<Chess["get"]>[0]);
-      if (!piece || piece.color !== playerColor) return false;
       setPremoves((prev) => [
         ...prev,
         { from: sourceSquare, to: targetSquare },
@@ -432,19 +428,9 @@ export default function AiPlayPage() {
       }
       // Build a speculative position with the existing queue applied so
       // that "is the from-square my piece?" reflects the chained state.
-      const spec = new Chess(chess.fen());
-      for (const pm of premoves) {
-        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
-        if (!p) break;
-        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
-        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
-        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
-      }
+      const spec = buildSpeculative(chess.fen(), premoves);
       if (selectedSquare) {
-        const fromPiece = spec.get(
-          selectedSquare as Parameters<Chess["get"]>[0],
-        );
-        if (fromPiece && fromPiece.color === playerColor) {
+        if (isLegalPremove(spec, selectedSquare, square, playerColor)) {
           setPremoves((prev) => [
             ...prev,
             { from: selectedSquare, to: square },
@@ -479,20 +465,7 @@ export default function AiPlayPage() {
   const displayPosition = useMemo(() => {
     if (!chessRef.current) return position;
     if (premoves.length === 0) return position;
-    const spec = new Chess(chessRef.current.fen());
-    for (const pm of premoves) {
-      const piece = spec.get(pm.from as Parameters<Chess["get"]>[0]);
-      if (!piece) break;
-      spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
-      spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
-      const isPromotion =
-        piece.type === "p" && (pm.to[1] === "8" || pm.to[1] === "1");
-      spec.put(
-        isPromotion ? { type: "q", color: piece.color } : piece,
-        pm.to as Parameters<Chess["put"]>[1],
-      );
-    }
-    return spec.fen();
+    return buildSpeculative(chessRef.current.fen(), premoves).fen();
   }, [position, premoves]);
 
   // (Premove application now happens inside the AI move callback above

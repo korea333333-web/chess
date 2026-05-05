@@ -74,7 +74,8 @@ export default function RankingPage() {
           </p>
         ) : rankings.length === 0 ? (
           <p className="text-center text-sm text-muted-foreground">
-            아직 랭킹이 없습니다.
+            아직 랭크 게임을 둔 사람이 없습니다.
+            <br />첫 번째가 되어보세요.
           </p>
         ) : (
           <div className="space-y-1">
