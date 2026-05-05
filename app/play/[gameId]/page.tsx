@@ -84,6 +84,16 @@ export default function OnlineGamePage({
   const [result, setResult] = useState<GameResult | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // chess.com-style premove queue (multiple moves can stack while it's the
+  // opponent's turn). Each opponent move consumes the head; an illegal head
+  // clears the chain.
+  const [premoves, setPremoves] = useState<
+    Array<{ from: string; to: string }>
+  >([]);
+  const premovesRef = useRef<Array<{ from: string; to: string }>>([]);
+  useEffect(() => {
+    premovesRef.current = premoves;
+  }, [premoves]);
 
   const myColor: "w" | "b" | null = useMemo(() => {
     if (!game || !user) return null;
@@ -276,14 +286,36 @@ export default function OnlineGamePage({
       sourceSquare: string;
       targetSquare: string | null;
     }): boolean => {
-      if (!targetSquare || !isMyTurn) return false;
-      // Library calls this synchronously; we kick off the await but always
-      // return true so the piece visually lands on the new square instantly.
-      // If the server rejects, our submitMove will rewind the board.
-      void submitMove(sourceSquare, targetSquare);
-      return true;
+      if (!targetSquare || sourceSquare === targetSquare) return false;
+      if (!game || result) return false;
+
+      if (isMyTurn) {
+        void submitMove(sourceSquare, targetSquare);
+        return true;
+      }
+
+      // Opponent's turn — append to premove queue, validating against the
+      // speculative position so chained drags work.
+      const real = chessRef.current!;
+      const spec = new Chess(real.fen());
+      for (const pm of premovesRef.current) {
+        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
+        if (!p) break;
+        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
+        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
+        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
+      }
+      const piece = spec.get(sourceSquare as Parameters<Chess["get"]>[0]);
+      if (!piece || piece.color !== myColor) return false;
+      setPremoves((prev) => [
+        ...prev,
+        { from: sourceSquare, to: targetSquare },
+      ]);
+      setSelectedSquare(null);
+      setLegalMoves([]);
+      return false;
     },
-    [isMyTurn, submitMove],
+    [game, result, isMyTurn, myColor, submitMove],
   );
 
   const selectSquare = useCallback(
@@ -308,20 +340,100 @@ export default function OnlineGamePage({
 
   const handleSquareClick = useCallback(
     ({ square }: { square: string }) => {
-      if (!isMyTurn || submitting) return;
+      if (!game || result) return;
+
+      if (isMyTurn) {
+        if (submitting) return;
+        if (selectedSquare && selectedSquare === square) {
+          setSelectedSquare(null);
+          setLegalMoves([]);
+          return;
+        }
+        if (selectedSquare && legalMoves.some((m) => m.to === square)) {
+          void submitMove(selectedSquare, square);
+          return;
+        }
+        selectSquare(square);
+        return;
+      }
+
+      // Opponent's turn — premove queue mode.
+      const cancelIdx = premoves.findIndex(
+        (pm) => pm.from === square || pm.to === square,
+      );
+      if (cancelIdx >= 0) {
+        setPremoves(premoves.slice(0, cancelIdx));
+        setSelectedSquare(null);
+        setLegalMoves([]);
+        return;
+      }
       if (selectedSquare && selectedSquare === square) {
         setSelectedSquare(null);
         setLegalMoves([]);
         return;
       }
-      if (selectedSquare && legalMoves.some((m) => m.to === square)) {
-        void submitMove(selectedSquare, square);
+      const real = chessRef.current!;
+      const spec = new Chess(real.fen());
+      for (const pm of premoves) {
+        const p = spec.get(pm.from as Parameters<Chess["get"]>[0]);
+        if (!p) break;
+        spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
+        spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
+        spec.put(p, pm.to as Parameters<Chess["put"]>[1]);
+      }
+      if (selectedSquare) {
+        const fromPiece = spec.get(
+          selectedSquare as Parameters<Chess["get"]>[0],
+        );
+        if (fromPiece && fromPiece.color === myColor) {
+          setPremoves((prev) => [
+            ...prev,
+            { from: selectedSquare, to: square },
+          ]);
+        }
+        setSelectedSquare(null);
+        setLegalMoves([]);
         return;
       }
-      selectSquare(square);
+      const piece = spec.get(square as Parameters<Chess["get"]>[0]);
+      if (piece && piece.color === myColor) {
+        setSelectedSquare(square);
+        setLegalMoves([]);
+      }
     },
-    [isMyTurn, submitting, selectedSquare, legalMoves, selectSquare, submitMove],
+    [
+      game,
+      result,
+      isMyTurn,
+      submitting,
+      selectedSquare,
+      legalMoves,
+      premoves,
+      myColor,
+      selectSquare,
+      submitMove,
+    ],
   );
+
+  // Speculative position with all queued premoves applied (display-only).
+  const displayPosition = useMemo(() => {
+    if (!chessRef.current) return position;
+    if (premoves.length === 0) return position;
+    const spec = new Chess(chessRef.current.fen());
+    for (const pm of premoves) {
+      const piece = spec.get(pm.from as Parameters<Chess["get"]>[0]);
+      if (!piece) break;
+      spec.remove(pm.from as Parameters<Chess["remove"]>[0]);
+      spec.remove(pm.to as Parameters<Chess["remove"]>[0]);
+      const isPromotion =
+        piece.type === "p" && (pm.to[1] === "8" || pm.to[1] === "1");
+      spec.put(
+        isPromotion ? { type: "q", color: piece.color } : piece,
+        pm.to as Parameters<Chess["put"]>[1],
+      );
+    }
+    return spec.fen();
+  }, [position, premoves]);
 
   const squareStyles = useMemo<Record<string, React.CSSProperties>>(() => {
     const chess = chessRef.current;
@@ -358,8 +470,38 @@ export default function OnlineGamePage({
         };
       }
     }
+
+    const premoveStyle: React.CSSProperties = {
+      boxShadow:
+        "inset 0 0 0 100px rgba(220,38,38,0.55), inset 0 0 0 4px rgba(127,29,29,1)",
+    };
+    for (const pm of premoves) {
+      styles[pm.from] = { ...(styles[pm.from] ?? {}), ...premoveStyle };
+      styles[pm.to] = { ...(styles[pm.to] ?? {}), ...premoveStyle };
+    }
     return styles;
-  }, [position, selectedSquare, legalMoves]);
+  }, [position, selectedSquare, legalMoves, premoves]);
+
+  // Auto-apply the head of the premove queue once it becomes my turn.
+  // submitMove handles server validation; an illegal head clears the chain.
+  useEffect(() => {
+    if (!game || result || game.status !== "active") return;
+    if (!chessRef.current) return;
+    if (chessRef.current.turn() !== myColor) return;
+    if (premoves.length === 0) return;
+    if (submitting) return;
+    const head = premoves[0];
+    let cancelled = false;
+    void (async () => {
+      const ok = await submitMove(head.from, head.to);
+      if (cancelled) return;
+      if (ok) setPremoves((prev) => prev.slice(1));
+      else setPremoves([]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [game, result, position, myColor, premoves, submitting, submitMove]);
 
   const handleResign = useCallback(async () => {
     if (!game || result) return;
@@ -433,13 +575,13 @@ export default function OnlineGamePage({
         <ChessBoardSurface className="my-4 w-full max-w-[560px] aspect-square">
           <Chessboard
             options={{
-              position,
+              position: displayPosition,
               onSquareClick: handleSquareClick,
               onPieceDrop: handlePieceDrop,
               squareStyles,
               animationDurationInMs: 200,
               showAnimations: true,
-              allowDragging: isMyTurn && !submitting,
+              allowDragging: !result && game.status === "active",
               canDragPiece: ({ piece }) =>
                 myColor !== null &&
                 piece.pieceType.charAt(0) === myColor,
@@ -473,11 +615,13 @@ export default function OnlineGamePage({
           isActive={isMyTurn}
           subtitle={
             game.status === "active"
-              ? isMyTurn
-                ? submitting
-                  ? "서버에 전송 중..."
-                  : "내 차례"
-                : "상대 차례"
+              ? premoves.length > 0
+                ? `미리둠 ${premoves.length}수 대기 중`
+                : isMyTurn
+                  ? submitting
+                    ? "서버에 전송 중..."
+                    : "내 차례"
+                  : "상대 차례"
               : undefined
           }
         />

@@ -372,13 +372,14 @@ export default function MainPage() {
 
       <footer className="border-t border-border">
         <div className="mx-auto flex w-full max-w-3xl items-center justify-center gap-6 px-6 py-4 text-sm text-muted-foreground">
-          <button className="hover:text-foreground transition-colors opacity-50 cursor-not-allowed">
-            랭킹 (Sprint 5)
-          </button>
+          <Link
+            href="/ranking"
+            className="hover:text-foreground transition-colors"
+          >
+            랭킹
+          </Link>
           <span className="text-border">·</span>
-          <button className="hover:text-foreground transition-colors opacity-50 cursor-not-allowed">
-            프로필 (Sprint 5)
-          </button>
+          <span className="opacity-50">프로필 (Sprint 5)</span>
         </div>
       </footer>
     </main>
